@@ -25,13 +25,11 @@ from open_webui.retrieval.vector.main import (
 )
 from open_webui.retrieval.vector.utils import iter_filter_conditions, process_metadata
 from qdrant_client import QdrantClient as Qclient
-from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.http.models import PointStruct
 from qdrant_client.models import models
 
 SCROLL_PAGE_SIZE = 1000
 TENANT_ID_FIELD = 'tenant_id'
-DEFAULT_DIMENSION = 384
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +79,10 @@ class QdrantClient(VectorDBBase):
             )
         )
 
-        # Main collection types for multi-tenancy
+        # Shared multi-tenant collections store each embedding size as a named
+        # vector whose name is the dimension (for example "1536"). Legacy
+        # collections with an unnamed default vector are still accepted when
+        # that size matches. Requires Qdrant >= 1.18 to add new sizes.
         self.MEMORY_COLLECTION = f'{self.collection_prefix}_memories'
         self.KNOWLEDGE_COLLECTION = f'{self.collection_prefix}_knowledge'
         self.FILE_COLLECTION = f'{self.collection_prefix}_files'
@@ -147,17 +148,20 @@ class QdrantClient(VectorDBBase):
         else:
             return self.KNOWLEDGE_COLLECTION, tenant_id
 
-    def _create_multi_tenant_collection(self, mt_collection_name: str, dimension: int = DEFAULT_DIMENSION):
+    def _create_multi_tenant_collection(self, mt_collection_name: str, dimension: int):
         """
         Creates a collection with multi-tenancy configuration and payload indexes for tenant_id and metadata fields.
         """
+        vector_name = str(dimension)
         self.client.create_collection(
             collection_name=mt_collection_name,
-            vectors_config=models.VectorParams(
-                size=dimension,
-                distance=models.Distance.COSINE,
-                on_disk=self.QDRANT_ON_DISK,
-            ),
+            vectors_config={
+                vector_name: models.VectorParams(
+                    size=dimension,
+                    distance=models.Distance.COSINE,
+                    on_disk=self.QDRANT_ON_DISK,
+                )
+            },
             # Disable global index building due to multitenancy
             # For more details https://qdrant.tech/documentation/guides/multiple-partitions/#calibrate-performance
             hnsw_config=models.HnswConfigDiff(
@@ -165,7 +169,11 @@ class QdrantClient(VectorDBBase):
                 m=0,
             ),
         )
-        log.info('Multi-tenant collection %s created with dimension %s!', mt_collection_name, dimension)
+        log.info(
+            'Multi-tenant collection %s created with named vector %s!',
+            mt_collection_name,
+            vector_name,
+        )
 
         self.client.create_payload_index(
             collection_name=mt_collection_name,
@@ -187,14 +195,70 @@ class QdrantClient(VectorDBBase):
                 ),
             )
 
-    def _create_points(self, items: List[VectorItem], tenant_id: str) -> List[PointStruct]:
+    def _vector_schemas(self, collection_name: str) -> Dict[int, Optional[str]]:
+        """Map dimension -> vector column name. `None` is the unnamed default."""
+        try:
+            info = self.client.get_collection(collection_name=collection_name)
+        except Exception:
+            log.debug('Could not read vector schema for %s', collection_name, exc_info=True)
+            return {}
+        params = getattr(getattr(info, 'config', None), 'params', None)
+        vectors = getattr(params, 'vectors', None)
+        # Missing collection params or a collection with no dense vectors configured.
+        if vectors is None:
+            return {}
+        # Legacy single unnamed vector: Qdrant returns VectorParams, not a name->params dict.
+        if not isinstance(vectors, dict):
+            size = getattr(vectors, 'size', None)
+            return {size: None} if isinstance(size, int) else {}
+        schemas: Dict[int, Optional[str]] = {}
+        for name, vector_params in vectors.items():
+            size = getattr(vector_params, 'size', None)
+            # Skip entries that are not dense vectors with a known size (e.g. sparse-only).
+            if not isinstance(size, int):
+                continue
+            # Unnamed default uses "" (or None); named columns always have a different size.
+            if not name:
+                schemas[size] = None
+            else:
+                schemas[size] = str(name)
+        return schemas
+
+    def _create_named_vector(self, collection_name: str, vector_name: str, dimension: int) -> None:
+        """Create a named vector column on the collection."""
+        self.client.create_vector_name(
+            collection_name=collection_name,
+            vector_name=vector_name,
+            vector_name_config=models.DenseVectorNameConfig(
+                dense=models.DenseVectorConfig(
+                    size=dimension,
+                    distance=models.Distance.COSINE,
+                )
+            ),
+        )
+        log.info('Added named vector %s to Qdrant collection %s', vector_name, collection_name)
+
+    def _ensure_vector_column(self, collection_name: str, dimension: int) -> Optional[str]:
+        """Return the vector column for `dimension`, creating a named one if needed."""
+        schemas = self._vector_schemas(collection_name)
+        if dimension in schemas:
+            return schemas[dimension]
+        vector_name = str(dimension)
+        self._create_named_vector(collection_name, vector_name, dimension)
+        return vector_name
+
+    def _create_points(
+        self, items: List[VectorItem], tenant_id: str, vector_name: Optional[str]
+    ) -> List[PointStruct]:
         """
         Create point structs from vector items with tenant ID.
+
+        `vector_name` is `None` for the unnamed default, or a named vector such as `"1536"`.
         """
         return [
             PointStruct(
                 id=item['id'],
-                vector=item['vector'],
+                vector={vector_name: item['vector']} if vector_name else item['vector'],
                 payload={
                     'text': item['text'],
                     'metadata': process_metadata(item['metadata']),
@@ -204,7 +268,7 @@ class QdrantClient(VectorDBBase):
             for item in items
         ]
 
-    def _ensure_collection(self, mt_collection_name: str, dimension: int = DEFAULT_DIMENSION):
+    def _ensure_collection(self, mt_collection_name: str, dimension: int):
         """
         Ensure the collection exists and payload indexes are created for tenant_id and metadata fields.
         """
@@ -274,6 +338,16 @@ class QdrantClient(VectorDBBase):
         if not self.client.collection_exists(collection_name=mt_collection):
             log.debug("Collection %s doesn't exist, search returns None", mt_collection)
             return None
+        dimension = len(vectors[0])
+        schemas = self._vector_schemas(mt_collection)
+        if dimension not in schemas:
+            log.debug(
+                'Collection %s has no vector slot for dimension %s, search returns None',
+                mt_collection,
+                dimension,
+            )
+            return None
+        vector_name = schemas[dimension]
 
         conditions = [_tenant_filter(tenant_id)]
         if filter:
@@ -281,6 +355,7 @@ class QdrantClient(VectorDBBase):
         query_response = self.client.query_points(
             collection_name=mt_collection,
             query=vectors[0],
+            using=vector_name,
             limit=limit,
             query_filter=models.Filter(must=conditions),
         )
@@ -331,7 +406,8 @@ class QdrantClient(VectorDBBase):
         mt_collection, tenant_id = self._get_collection_and_tenant_id(collection_name)
         dimension = len(items[0]['vector'])
         self._ensure_collection(mt_collection, dimension)
-        points = self._create_points(items, tenant_id)
+        vector_name = self._ensure_vector_column(mt_collection, dimension)
+        points = self._create_points(items, tenant_id, vector_name)
         self.client.upload_points(mt_collection, points)
         return None
 
